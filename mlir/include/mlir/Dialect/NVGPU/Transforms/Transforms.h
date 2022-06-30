@@ -19,6 +19,10 @@
 namespace mlir {
 namespace nvgpu {
 
+///
+/// Passes
+///
+
 /// Optimizes vectorized accesses to a shared memory buffer specified by
 /// memrefValue. This transformation assumes the following:
 /// 1) All relevant accesses to `memrefValue` are contained with `parentOp`.
@@ -40,6 +44,16 @@ namespace nvgpu {
 /// dimension of the memref have minimal conflicts.
 mlir::LogicalResult optimizeSharedMemoryReadsAndWrites(Operation *parentOp,
                                                        Value memrefValue);
+
+
+///
+/// Rewrites patterns
+///
+
+/// Collect patterns to convert mma.sync on f32 input and rewrite to use 
+/// (a) 1xtf32 (one mma.sync using tfloat32) `OR`
+//  (b) 3xtf32 (three mma.sync using tfloat32 datatype)
+void populateMmaSyncF32ToT32Patterns(RewritePatternSet &patterns);
 
 } // namespace nvgpu
 } // namespace mlir

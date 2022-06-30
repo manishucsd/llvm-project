@@ -110,8 +110,12 @@ def NVGPU_MmaSyncOp : NVGPU_Op<"mma.sync", [
     (vector<4x2xf16>, vector<2x2xf16>, vector<2x2xf16>) -> vector<2x2xf16>
   ```
   }];
-  let arguments = (ins AnyVector:$matrixA, AnyVector:$matrixB,
-                       AnyVector:$matrixC, I64ArrayAttr:$mmaShape);
+  let arguments = (ins AnyVector:$matrixA, 
+                       AnyVector:$matrixB,
+                       AnyVector:$matrixC, 
+                       I64ArrayAttr:$mmaShape,
+                       OptionalAttr<BoolAttr>:$tf32Enabled
+                       );
 
   let results = (outs AnyVector:$res);
 
