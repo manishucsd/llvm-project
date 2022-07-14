@@ -41,6 +41,11 @@ namespace nvgpu {
 mlir::LogicalResult optimizeSharedMemoryReadsAndWrites(Operation *parentOp,
                                                        Value memrefValue);
 
+/// Enables tf32 lowering of f32 input to nvgpu.mma.sync op by setting the 
+/// optional MmaSyncOp::tf32Enable boolean attribute 
+mlir::LogicalResult mmasyncOpF32toTf32(Operation *mmaSyncOp, 
+                                       Precision precision); 
+
 } // namespace nvgpu
 } // namespace mlir
 

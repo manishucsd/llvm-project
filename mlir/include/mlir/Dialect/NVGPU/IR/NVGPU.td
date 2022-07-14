@@ -96,7 +96,9 @@ def NVGPU_MmaSyncOp : NVGPU_Op<"mma.sync", [
   matrix-multiply-and-accumulate (mma) operation that is compatible with
   `nvvm.mma.sync`. The operands and results are fragments of the full matrix
   operands. The full shape of the distributed mma operation is given by the
-  `mmaShape` attribute in the form of a list of dimensions `[m, n, k]`.
+  `mmaShape` attribute in the form of a list of dimensions `[m, n, k]`. The
+  `tf32Enable` optional attribute is ba oolean which allows f32 to tf32 
+  conversion to enable `nvgpu.mma.sync` op using tf32 data path.
 
   This operation is meant to be lowered to the `nvvm.mma.sync` instruction, and
   is an intermediate point between lowering from `vector.contract` to
@@ -113,7 +115,8 @@ def NVGPU_MmaSyncOp : NVGPU_Op<"mma.sync", [
   ```
   }];
   let arguments = (ins AnyVector:$matrixA, AnyVector:$matrixB,
-                       AnyVector:$matrixC, I64ArrayAttr:$mmaShape);
+                       AnyVector:$matrixC, I64ArrayAttr:$mmaShape, 
+                       OptionalAttr<BoolAttr>:$tf32Enable);
 
   let results = (outs AnyVector:$res);
 
@@ -128,7 +131,6 @@ def NVGPU_MmaSyncOp : NVGPU_Op<"mma.sync", [
 
 def NVGPU_DeviceAsyncCopyOp : NVGPU_Op<"device_async_copy", [
                                        AttrSizedOperandSegments]> {
-                                        
   let summary = "device-side asynchronous copy";
   let description = [{
     The `gpu.device_async_copy` op initiates an asynchronous copy operation of
