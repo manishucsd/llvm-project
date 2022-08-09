@@ -16,6 +16,70 @@
 
 using namespace mlir;
 
+// This returns the byte offset into source Shared Memory for nvgpu::LdMatrixOp
+// idx[2] * sizeof(type) * stride[2] + (base + idx[1] * stride[1] + idx[0]) * sizeof(type)
+// baseOffset
+static  Value getLdMatrixOpByteOffset(
+          Location loc, MemRefType memRefType, Value memRefDesc,
+          ValueRange indices, ConversionPatternRewriter &rewriter) {
+
+  Value ldMatrixOpByteOffset;
+
+  int64_t offset;
+  SmallVector<int64_t, 4> strides;
+  auto status = getStridesAndOffset(memRefType, strides, offset);
+  assert(succeeded(status) && "unexpected non-strided memref");
+  (void)status;
+
+  assert(strides.size() == 3 && "expected multistage pipeline 3d shaped Shared Memory");
+
+  MemRefDescriptor memRefDescriptor(memRefDesc);
+  Type elementPtrType = memRefDescriptor.getElementPtrType();
+  Type elementType = memRefType.getElementType();
+  Value basePtr = memRefDescriptor.alignedPtr(rewriter, loc);
+  Value baseOffset = rewriter.create<LLVM::PtrToIntOp>(
+                                loc, 
+                                IntegerType::get(rewriter.getContext(), 64), 
+                                basePtr);
+
+  Value sizeInBytes = rewriter.create<LLVM::ConstantOp>(
+        loc, IntegerType::get(rewriter.getContext(), 64),
+        rewriter.getI64IntegerAttr(memRefType.getElementTypeBitWidth() / 8));
+
+  // Value baseByteOffset = rewriter.create<LLVM::MulOp>(loc, baseOffset, sizeInBytes);
+  
+  Value stride_2 = rewriter.create<LLVM::ConstantOp>(
+        loc, IntegerType::get(rewriter.getContext(), 64),
+        rewriter.getI64IntegerAttr(strides[2]));
+
+  Value offsetStride2 = rewriter.create<LLVM::MulOp>(loc, indices[2], stride_2);
+
+  Value stride_1 = rewriter.create<LLVM::ConstantOp>(
+        loc, IntegerType::get(rewriter.getContext(), 64),
+        rewriter.getI64IntegerAttr(strides[1]));
+
+  Value offsetStride1 = rewriter.create<LLVM::MulOp>(loc, indices[1], stride_1);
+
+  // Loop invariant part of the LdMatrixOp address arithmetic.
+  Value invariantByteOffset = rewriter.create<LLVM::AddOp>(loc, offsetStride1, offsetStride2);
+  invariantByteOffset = rewriter.create<LLVM::MulOp>(loc, invariantByteOffset, sizeInBytes);
+  invariantByteOffset = rewriter.create<LLVM::AddOp>(loc, invariantByteOffset, baseByteOffset);
+
+  // Loop variant part of the LdMatrixOp address arithmetic.
+  Value ldmatrixByteOffset = rewriter.create<LLVM::MulOp>(loc, indices[0], sizeInBytes);
+
+  // Final nvgpu::ldmatrix Shared Memory byte offset.
+  ldmatrixByteOffset = rewriter.create<LLVM::AddOp>(loc, 
+                                    invariantByteOffset, ldmatrixByteOffset);
+
+    Value zero = rewriter.create<LLVM::ConstantOp>(
+        loc, IntegerType::get(rewriter.getContext(), 64),
+        rewriter.getI64IntegerAttr(0));
+
+  return rewriter.create<LLVM::IntToPtrOp>(loc, elementPtrType, ldmatrixByteOffset);
+  //return rewriter.create<LLVM::GEPOp>(loc, elementPtrType, srcByteOffset, zero);
+}
+
 /// Returns the type for the intrinsic given the vectorResultType of the
 /// `gpu.mma.sync` operation.
 static Type inferIntrinsicResultType(Type vectorResultType) {
@@ -222,8 +286,13 @@ struct MmaLdMatrixOpToNVVM : public ConvertOpToLLVMPattern<nvgpu::LdMatrixOp> {
     }
 
     auto srcMemrefType = op.getSrcMemref().getType().cast<MemRefType>();
+#if 0
     Value srcPtr =
         getStridedElementPtr(loc, srcMemrefType, adaptor.getSrcMemref(),
+                             adaptor.getIndices(), rewriter);
+#endif
+    Value srcPtr =
+        getLdMatrixOpByteOffset(loc, srcMemrefType, adaptor.getSrcMemref(),
                              adaptor.getIndices(), rewriter);
     Value ldMatrixResult = rewriter.create<NVVM::LdMatrixOp>(
         loc, ldMatrixResultType, srcPtr,
