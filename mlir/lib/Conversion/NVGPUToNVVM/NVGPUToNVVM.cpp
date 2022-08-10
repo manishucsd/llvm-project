@@ -17,8 +17,6 @@
 using namespace mlir;
 
 // This returns the byte offset into source Shared Memory for nvgpu::LdMatrixOp
-// idx[2] * sizeof(type) * stride[2] + (base + idx[1] * stride[1] + idx[0]) * sizeof(type)
-// baseOffset
 static  Value getLdMatrixOpByteOffset(
           Location loc, MemRefType memRefType, Value memRefDesc,
           ValueRange indices, ConversionPatternRewriter &rewriter) {
