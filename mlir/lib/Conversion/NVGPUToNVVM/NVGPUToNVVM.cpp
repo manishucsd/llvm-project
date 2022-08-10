@@ -32,7 +32,7 @@ static  Value getLdMatrixOpByteOffset(
   (void)status;
 
   assert(strides.size() == 3 && "expected multistage pipeline 3d shaped Shared Memory");
-
+  
   MemRefDescriptor memRefDescriptor(memRefDesc);
   Type elementPtrType = memRefDescriptor.getElementPtrType();
   Type elementType = memRefType.getElementType();
@@ -45,8 +45,6 @@ static  Value getLdMatrixOpByteOffset(
   Value sizeInBytes = rewriter.create<LLVM::ConstantOp>(
         loc, IntegerType::get(rewriter.getContext(), 64),
         rewriter.getI64IntegerAttr(memRefType.getElementTypeBitWidth() / 8));
-
-  // Value baseByteOffset = rewriter.create<LLVM::MulOp>(loc, baseOffset, sizeInBytes);
   
   Value stride_2 = rewriter.create<LLVM::ConstantOp>(
         loc, IntegerType::get(rewriter.getContext(), 64),
@@ -63,21 +61,21 @@ static  Value getLdMatrixOpByteOffset(
   // Loop invariant part of the LdMatrixOp address arithmetic.
   Value invariantByteOffset = rewriter.create<LLVM::AddOp>(loc, offsetStride1, offsetStride2);
   invariantByteOffset = rewriter.create<LLVM::MulOp>(loc, invariantByteOffset, sizeInBytes);
-  invariantByteOffset = rewriter.create<LLVM::AddOp>(loc, invariantByteOffset, baseByteOffset);
+  invariantByteOffset = rewriter.create<LLVM::AddOp>(loc, invariantByteOffset, baseOffset);
 
   // Loop variant part of the LdMatrixOp address arithmetic.
-  Value ldmatrixByteOffset = rewriter.create<LLVM::MulOp>(loc, indices[0], sizeInBytes);
+  Value stride_0 = rewriter.create<LLVM::ConstantOp>(
+        loc, IntegerType::get(rewriter.getContext(), 64),
+        rewriter.getI64IntegerAttr(strides[0]));
+  Value offsetStride0 = rewriter.create<LLVM::MulOp>(loc, indices[0], stride_0);
 
-  // Final nvgpu::ldmatrix Shared Memory byte offset.
+  Value ldmatrixByteOffset = rewriter.create<LLVM::MulOp>(loc, offsetStride0, sizeInBytes);
+
+  // LdMatrix Shared Memory byte offset.
   ldmatrixByteOffset = rewriter.create<LLVM::AddOp>(loc, 
                                     invariantByteOffset, ldmatrixByteOffset);
 
-    Value zero = rewriter.create<LLVM::ConstantOp>(
-        loc, IntegerType::get(rewriter.getContext(), 64),
-        rewriter.getI64IntegerAttr(0));
-
   return rewriter.create<LLVM::IntToPtrOp>(loc, elementPtrType, ldmatrixByteOffset);
-  //return rewriter.create<LLVM::GEPOp>(loc, elementPtrType, srcByteOffset, zero);
 }
 
 /// Returns the type for the intrinsic given the vectorResultType of the
