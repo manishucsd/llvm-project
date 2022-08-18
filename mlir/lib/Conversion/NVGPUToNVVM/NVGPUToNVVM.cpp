@@ -348,6 +348,41 @@ struct ConvertNVGPUToNVVMPass
   }
 };
 
+
+static void emitAsyncCopyZfillInlineAsm(Location loc, 
+                          Value dstPtr, Value srcPtr, 
+                          Value sizeInBytes, Value loadElements,
+                          mlir::MemRefType elementType, ConversionPatternRewriter &rewriter) {
+
+    auto asmDialectAttr = LLVM::AsmDialectAttr::get(rewriter.getContext(),
+                                                    LLVM::AsmDialect::AD_ATT);
+#if 1
+    const char *asmStr = "cp.async.ca.shared.global [%0], [%1], %2, %3;\n :: "
+                          "r($0), l($1), n($2), r($3));";
+
+    const char *asmConstraints = "";
+#endif
+    
+    Value c3I32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 3);
+    Value bitwdith = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 
+                        elementType.getElementTypeBitWidth());
+    Value loadBytes = rewriter.create<LLVM::LShrOp>(
+                                  loc, 
+                                  rewriter.create<LLVM::MulOp>(loc, bitwdith, loadElements), 
+                                  c3I32);
+    
+    SmallVector<Value> asmVals{srcPtr, dstPtr, sizeInBytes, loadBytes};
+
+#if 1
+    rewriter.create<LLVM::InlineAsmOp>(
+      loc, elementType.getElementType(), /*operands=*/asmVals, /*asm_string=*/asmStr,
+      /*constraints=*/asmConstraints, /*has_side_effects=*/true,
+      /*is_align_stack=*/false, /*asm_dialect=*/asmDialectAttr,
+      /*operand_attrs=*/ArrayAttr());
+#endif
+
+}
+
 struct NVGPUAsyncCopyLowering
     : public ConvertOpToLLVMPattern<nvgpu::DeviceAsyncCopyOp> {
   using ConvertOpToLLVMPattern<
@@ -356,6 +391,7 @@ struct NVGPUAsyncCopyLowering
   LogicalResult
   matchAndRewrite(nvgpu::DeviceAsyncCopyOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    
     Location loc = op->getLoc();
     auto dstMemrefType = op.getDst().getType().cast<MemRefType>();
     Value dstPtr = getStridedElementPtr(loc, dstMemrefType, adaptor.getDst(),
@@ -384,9 +420,22 @@ struct NVGPUAsyncCopyLowering
     // otherwise.
     UnitAttr bypassL1 =
         sizeInBytes == 16 ? adaptor.getBypassL1Attr() : UnitAttr();
-    rewriter.create<NVVM::CpAsyncOp>(
-        loc, dstPtr, scrPtr, rewriter.getI32IntegerAttr(sizeInBytes), bypassL1);
 
+    // cp_async_zfill
+    if (op.getLoadElements()) {
+
+      emitAsyncCopyZfillInlineAsm(loc, dstPtr, scrPtr, 
+                                  rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), sizeInBytes), 
+                                  op.getLoadElements(), 
+                                  srcMemrefType, rewriter);
+    } 
+    
+    // cp_async
+    else {
+      rewriter.create<NVVM::CpAsyncOp>(
+          loc, dstPtr, scrPtr, rewriter.getI32IntegerAttr(sizeInBytes), bypassL1);
+    }
+    
     // Drop the result token.
     Value zero = rewriter.create<LLVM::ConstantOp>(
         op->getLoc(), IntegerType::get(op.getContext(), 32),
