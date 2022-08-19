@@ -358,10 +358,9 @@ static void emitAsyncCopyZfillInlineAsm(Location loc,
     auto asmDialectAttr = LLVM::AsmDialectAttr::get(rewriter.getContext(),
                                                     LLVM::AsmDialect::AD_ATT);
 #if 1
-    const char *asmStr = "cp.async.ca.shared.global [%0], [%1], %2, %3;\n :: "
-                         "r($0), l($1), n($2), r($3));";
+    const char *asmStr = "cp.async.ca.shared.global [$0], [$1], $2, $3;\n";
 
-    const char *asmConstraints = "";
+    const char *asmConstraints = "r,l,n,r";
 #endif
     
     Value c3I32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 3);
