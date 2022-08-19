@@ -13,6 +13,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "llvm/IR/IRBuilder.h"
 
 using namespace mlir;
 
@@ -358,24 +359,25 @@ static void emitAsyncCopyZfillInlineAsm(Location loc,
                                                     LLVM::AsmDialect::AD_ATT);
 #if 1
     const char *asmStr = "cp.async.ca.shared.global [%0], [%1], %2, %3;\n :: "
-                          "r($0), l($1), n($2), r($3));";
+                         "r($0), l($1), n($2), r($3));";
 
     const char *asmConstraints = "";
 #endif
     
     Value c3I32 = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 3);
-    Value bitwdith = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 
+    Value bitwidth = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 
                         elementType.getElementTypeBitWidth());
+    Value loadElementI32 = rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), loadElements);
     Value loadBytes = rewriter.create<LLVM::LShrOp>(
                                   loc, 
-                                  rewriter.create<LLVM::MulOp>(loc, bitwdith, loadElements), 
+                                  rewriter.create<LLVM::MulOp>(loc, bitwidth, loadElementI32), 
                                   c3I32);
     
     SmallVector<Value> asmVals{srcPtr, dstPtr, sizeInBytes, loadBytes};
 
 #if 1
     rewriter.create<LLVM::InlineAsmOp>(
-      loc, elementType.getElementType(), /*operands=*/asmVals, /*asm_string=*/asmStr,
+      loc, LLVM::LLVMVoidType::get(rewriter.getContext()), /*operands=*/asmVals, /*asm_string=*/asmStr,
       /*constraints=*/asmConstraints, /*has_side_effects=*/true,
       /*is_align_stack=*/false, /*asm_dialect=*/asmDialectAttr,
       /*operand_attrs=*/ArrayAttr());
@@ -426,7 +428,7 @@ struct NVGPUAsyncCopyLowering
 
       emitAsyncCopyZfillInlineAsm(loc, dstPtr, scrPtr, 
                                   rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), sizeInBytes), 
-                                  op.getLoadElements(), 
+                                  adaptor.getLoadElements(), 
                                   srcMemrefType, rewriter);
     } 
     
