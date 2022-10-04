@@ -51,14 +51,22 @@ std::array<int64_t, 2> getTileShape(ArrayRef<int64_t> operandShape,
 
 } // namespace
 
+FailureOr<vector::ContractionOp> getUserContract(Operation *op) {
+  for (Operation *user : op->getUsers()) {
+    if (auto contractOp = dyn_cast<vector::ContractionOp>(user))
+      return contractOp;
+  }
+  return failure();
+}
+
 FailureOr<WarpMatrixInfo> getWarpMatrixInfo(Operation *op) {
   WarpMatrixInfo info;
 
-  // Determine the vector type.
+  // Determine the vector type at warp-level.
   if (vector::TransferWriteOp writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
     info.vectorType = writeOp.getVectorType();
   } else if (isa<vector::TransferReadOp, vector::ContractionOp,
-                 arith::ConstantOp>(op)) {
+                 vector::ExtractStridedSliceOp, arith::ConstantOp>(op)) {
     info.vectorType = op->getResult(0).getType().cast<VectorType>();
   } else {
     return op->emitError()

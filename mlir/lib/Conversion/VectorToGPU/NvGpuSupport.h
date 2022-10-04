@@ -33,6 +33,10 @@ struct WarpMatrixInfo {
   MatMulOperandRole operandRole;
 };
 
+/// Returns the first user of the op that is vector.contract `op`.
+/// If no vector.contract user are ther for the `op` failure is returned.
+FailureOr<vector::ContractionOp> getUserContract(Operation *op);
+
 /// Given an op that operates on a VectorType representing a warp-level matrix
 /// operand, the function returns a struct containing relevant type information.
 FailureOr<WarpMatrixInfo> getWarpMatrixInfo(Operation *op);
