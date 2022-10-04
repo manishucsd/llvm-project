@@ -54,11 +54,11 @@ std::array<int64_t, 2> getTileShape(ArrayRef<int64_t> operandShape,
 FailureOr<WarpMatrixInfo> getWarpMatrixInfo(Operation *op) {
   WarpMatrixInfo info;
 
-  // Determine the vector type.
+  // Determine the vector type at warp-level.
   if (vector::TransferWriteOp writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
     info.vectorType = writeOp.getVectorType();
-  } else if (isa<vector::TransferReadOp, vector::ContractionOp,
-                 arith::ConstantOp>(op)) {
+  } else if (isa<vector::TransferReadOp, vector::ContractionOp, 
+                 vector::ExtractStridedSliceOp, arith::ConstantOp>(op)) {
     info.vectorType = op->getResult(0).getType().cast<VectorType>();
   } else {
     return op->emitError()

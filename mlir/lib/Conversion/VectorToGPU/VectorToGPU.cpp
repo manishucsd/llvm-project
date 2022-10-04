@@ -29,6 +29,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <iostream>
+
+#define DEBUG_LEVEL_VectorToGPU 0
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTVECTORTOGPU
@@ -191,6 +194,12 @@ static bool elementwiseSupportsMMAMatrixType(Operation *op) {
   return convertElementwiseOpToMMA(op).has_value();
 }
 
+/// Returns true if the extract strided slice op is supported with `mma.sync` path.
+static bool extractStridedSliceSupportsMMAMatrixType(vector::ExtractStridedSliceOp extractStrideSliceOp, bool useNvGpu) {
+  // TODO: put some basic checks on the vector::ExtractStridedSliceOp.
+  return true;
+}
+
 static bool supportsMMaMatrixType(Operation *op, bool useNvGpu) {
   if (isa<scf::ForOp, scf::YieldOp>(op))
     return true;
@@ -198,6 +207,8 @@ static bool supportsMMaMatrixType(Operation *op, bool useNvGpu) {
     return transferReadSupportsMMAMatrixType(transferRead, useNvGpu);
   if (auto transferWrite = dyn_cast<vector::TransferWriteOp>(op))
     return transferWriteSupportsMMAMatrixType(transferWrite);
+  if (auto extractStridedSlice = dyn_cast<vector::ExtractStridedSliceOp>(op))
+    return extractStridedSliceSupportsMMAMatrixType(extractStridedSlice, useNvGpu);
   if (auto contract = dyn_cast<vector::ContractionOp>(op))
     return contractSupportsMMAMatrixType(contract, useNvGpu);
   if (auto constant = dyn_cast<arith::ConstantOp>(op))
@@ -337,8 +348,10 @@ struct PrepareContractToGPUMMA
   }
 };
 
-// Merge transpose op into the transfer read op. Transpose are not supported on
-// MMA types but MMA load can transpose the matrix when loading.
+// Fold transpose op into the transfer read op. Nvgpu mma.sync op only supports 
+// row-, column-, and row-major layout for matrixA, matrixB, and matrixC, respectively.
+// We can fold the transpose operation when loading the data from Shared Memory to
+// registers. 
 struct CombineTransferReadOpTranspose final
     : public OpRewritePattern<vector::TransposeOp> {
   using OpRewritePattern<vector::TransposeOp>::OpRewritePattern;
@@ -619,7 +632,7 @@ convertTransferReadToLoads(vector::TransferReadOp op,
   int64_t bitWidth = vecTy.getElementType().getIntOrFloatBitWidth();
 
   // When we are transposing the B operand, ldmatrix will only work if we have
-  // at least 8 rows to read and  the width to read for the transpose is 128
+  // at least 8 rows to read and the width to read for the transpose is 128
   // bits.
   if (!op.getPermutationMap().isMinorIdentity() &&
       (bitWidth != 16 || vecTy.getDimSize(1) < 8 ||
@@ -667,6 +680,102 @@ convertTransferWriteToStores(vector::TransferWriteOp op,
     b.create<vector::StoreOp>(loc, el, op.getSource(), newIndices);
   }
   op->erase();
+  return success();
+}
+
+static void populateFromInt64AttrArray(ArrayAttr arrayAttr,
+                                       SmallVectorImpl<int64_t> &results) {
+  for (auto attr : arrayAttr)
+    results.push_back(attr.cast<IntegerAttr>().getInt());
+}
+
+static LogicalResult 
+convertExtractStridedSlice(vector::ExtractStridedSliceOp op,
+                           llvm::DenseMap<Value, Value> &valueMapping) {
+
+  OpBuilder b(op);
+  Location loc = op->getLoc();
+
+  FailureOr<nvgpu::WarpMatrixInfo> warpMatrixInfo =
+      nvgpu::getWarpMatrixInfo(op);
+  if (failed(warpMatrixInfo))
+    return failure();
+
+  FailureOr<nvgpu::FragmentElementInfo> mmaSyncFragmentInfo =
+      nvgpu::getMmaSyncRegisterType(*warpMatrixInfo);
+  if (failed(mmaSyncFragmentInfo))
+    return failure();
+
+  // Find the vector.transer_read whose result vector is being sliced.
+  auto transferReadOp =
+        op.getVector().getDefiningOp<vector::TransferReadOp>();
+  
+  warpMatrixInfo =
+      nvgpu::getWarpMatrixInfo(transferReadOp);
+  if (failed(warpMatrixInfo))
+    return failure();
+
+  FailureOr<nvgpu::FragmentElementInfo> ldFragmentInfo = 
+    nvgpu::getMmaSyncRegisterType(*warpMatrixInfo);
+  if (failed(ldFragmentInfo))
+    return failure();
+
+  assert((mmaSyncFragmentInfo->elementsPerRegister == 
+         ldFragmentInfo->elementsPerRegister) && 
+         "Number of elements per register should be same for load and mma.sync");
+
+  // Create vector.extract_strided_slice op for thread-owned fragments.
+  std::array<int64_t, 2> strides = {1, 1}; // stride for extract slice is always 1.
+  std::array<int64_t, 2>  sliceShape = {mmaSyncFragmentInfo->numRegistersPerFragment, 
+                                        mmaSyncFragmentInfo->elementsPerRegister};
+  auto sourceVector = valueMapping.find(transferReadOp)->second;
+
+  // offset and sizes at warp-level of onwership.
+  SmallVector<int64_t> offsets;
+  populateFromInt64AttrArray(op.getOffsets(), offsets);
+
+  SmallVector<int64_t> sizes;
+  populateFromInt64AttrArray(op.getSizes(), sizes);
+  ArrayRef<int64_t> warpVectorShape = op.getVectorType().getShape();
+
+#if DEBUG_LEVEL_VectorToGPU
+  std::cout << "offsets         {" << offsets[0] << ", " << offsets[1] << "}" << std::endl;
+  std::cout << "sizes           {" << sizes[0] << ", " << sizes[1] << "}" << std::endl;
+  std::cout << "warpVectorShape {" << warpVectorShape[0] << ", " << warpVectorShape[1] << "}" << std::endl;  
+#endif
+
+  // Compute offset in vector registers. Note that the mma.sync vector registers are shaped 
+  // as numberOfFragments x numberOfRegistersPerfFragment. The vector registers can only be 
+  // sliced along numberOfFragments, i.e., sliceOffset[0].
+  std::array<int64_t, 2>  sliceOffset = {0, 0};
+
+  if (offsets[0] && offsets[1]) 
+    return op->emitError() << "Slicing fragments in 2D is not supported. ";
+  else if (offsets[0])
+    sliceOffset[0] = (warpVectorShape[0] / offsets[0]);
+  else if (offsets[1])
+    sliceOffset[0] = (warpVectorShape[1] / offsets[1]);
+
+#if DEBUG_LEVEL_VectorToGPU
+  std::cout << "mma.sync vector shape : " 
+            << mmaSyncFragmentInfo->numRegistersPerFragment << "x"
+            << mmaSyncFragmentInfo->elementsPerRegister << std::endl;
+
+  std::cout << "load vector shape : " 
+            << ldFragmentInfo->numRegistersPerFragment << "x"
+            << ldFragmentInfo->elementsPerRegister << std::endl;
+            
+  std::cout << "sliceOffset     {" << sliceOffset[0] << ", " << sliceOffset[1] << "}" << std::endl;
+#endif
+
+  Value newOp = b.create<vector::ExtractStridedSliceOp>(
+    loc, sourceVector, sliceOffset, sliceShape, strides);
+
+#if DEBUG_LEVEL_VectorToGPU
+  transferReadOp->dump();
+#endif
+
+  valueMapping[op] = newOp;
   return success();
 }
 
@@ -849,12 +958,22 @@ LogicalResult mlir::convertVectorToNVVMCompatibleMMASync(Operation *rootOp) {
   SetVector<Operation *> ops = getOpToConvert(rootOp, /*useNvGpu=*/true);
   llvm::DenseMap<Value, Value> valueMapping;
   for (Operation *op : ops) {
+
+#if DEBUG_LEVEL_VectorToGPU
+    std::cout << "<< start conversion of op: " << std::endl;; 
+    op->dump();
+#endif
+
     if (llvm::TypeSwitch<Operation *, LogicalResult>(op)
             .Case([&](vector::TransferReadOp transferReadOp) {
               return convertTransferReadToLoads(transferReadOp, valueMapping);
             })
             .Case([&](vector::TransferWriteOp transferWriteOp) {
               return convertTransferWriteToStores(transferWriteOp,
+                                                  valueMapping);
+            })
+            .Case([&](vector::ExtractStridedSliceOp extractStridedSliceOp) {
+              return convertExtractStridedSlice(extractStridedSliceOp,
                                                   valueMapping);
             })
             .Case([&](vector::ContractionOp contractionOp) {
@@ -879,6 +998,11 @@ LogicalResult mlir::convertVectorToNVVMCompatibleMMASync(Operation *rootOp) {
       op->emitError() << "Failed to convert op " << *op;
       return failure();
     }
+
+#if DEBUG_LEVEL_VectorToGPU
+    valueMapping[op->getResult(0)].dump();
+    std::cout << ">> end  conversion of op: " << std::endl;
+#endif
   }
   return success();
 }
