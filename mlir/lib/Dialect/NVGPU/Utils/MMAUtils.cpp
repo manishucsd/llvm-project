@@ -249,27 +249,20 @@ nvgpu::getLaneIdToLdMatrixMatrixCoord(Location loc, OpBuilder &builder,
     return AffineMap::get(1, 0, dimExprs, builder.getContext());
   };
 
-  // This case corresponds to row-major A|C or col-major B operands.
-  if (params.contiguousDimType == vector::IteratorType::reduction) {
     AffineExpr row = d0 % (operandShape[0]);
     AffineExpr col = d0.floorDiv(operandShape[0]) * (kElementsPer128b);
+
+  // This case corresponds to row-major A|C or col-major B operands.
+  if (params.contiguousDimType == vector::IteratorType::reduction) {
     return makeMap({row, col});
   }
 
   // This case Corresponds to col-major A|C or row-major B operands. The
   // operandShape given is already pre-transposed (e.g. 8x16 = KxN).
   if (params.contiguousDimType == vector::IteratorType::parallel) {
-    const int64_t num8x128bCols = (operandShape[0] * bitsPerElement) / 128;
-    // Threads are assigned in groups of 8 first across columns, then to
-    // rows. This is transpose of what `ldmatrix` expects, but when
-    // `ldmatrix` gets the `.trans` qualifier, final the effect will be to
-    // transpose just the blocks.
-    auto groupIdx = d0.floorDiv(kNumThreadsPerTile);
-    auto tileCol = (groupIdx % num8x128bCols);
-    auto tileRow = groupIdx.floorDiv(num8x128bCols);
-    return makeMap({tileCol * kElementsPer128b,
-                    tileRow * kNumRowsPerTile + (d0 % kNumRowsPerTile)});
+    return makeMap({col, row});
   }
+
   return failure();
 }
 

@@ -601,6 +601,7 @@ createNonLdMatrixLoads(vector::TransferReadOp op, OpBuilder &builder,
                                                 builder.getI64ArrayAttr(i));
     }
   } else {
+    // TODO: Needs fix for the transpose ld.
     if (auto vecType = loadedElType.dyn_cast<VectorType>()) {
       loadedElType = vecType.getElementType();
     }
