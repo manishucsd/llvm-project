@@ -59,7 +59,7 @@ gpu.module @kernel {
   }
 }
 
-// CHECK-LABEL:  llvm.func @workgroup
+// CHECK-LABEL:  llvm.func @dynamic_shmem
 //       CHECK:  llvm.store
 //  CHECK-SAME:   : f32, !llvm.ptr<3>
 

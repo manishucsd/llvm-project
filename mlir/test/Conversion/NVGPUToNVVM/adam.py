@@ -1,3 +1,5 @@
+# RUN:   %PYTHON %s 
+
 import numpy as np
 import pathlib
 from mlir import ir
