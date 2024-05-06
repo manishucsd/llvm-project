@@ -374,6 +374,10 @@ struct MmaSyncOptoNVVM : public ConvertOpToLLVMPattern<nvgpu::MmaSyncOp> {
     Type desiredRetTy = typeConverter->convertType(op->getResultTypes()[0]);
     Type intrinsicResTy = inferIntrinsicResultType(
         typeConverter->convertType(op->getResultTypes()[0]));
+
+    LLVM_DEBUG(DBGS() << " desiredRetTy: "; desiredRetTy.dump();
+               DBGS() << " intrinsicResTy: "; intrinsicResTy.dump(););
+
     Value intrinsicResult = b.create<NVVM::MmaOp>(
         intrinsicResTy, matA, matB, matC,
         /*shape=*/gemmShape,
@@ -1211,62 +1215,12 @@ struct NVGPUWarpgroupMmaOpLowering
     : public ConvertOpToLLVMPattern<nvgpu::WarpgroupMmaOp> {
   using ConvertOpToLLVMPattern<nvgpu::WarpgroupMmaOp>::ConvertOpToLLVMPattern;
 
-  /// This is a helper class to generate required NVVM Ops for warp-group level
-  /// matrix multiplication.
-  /// When the given GEMM shape is larger than the shape of
-  /// a wgmma instrution in PTX, it can generate multiple NVVM::WgmmaMmaAsyncOp
-  /// Op(s), group and execute them asynchronously. The class also handles
-  /// waiting for completion and iterates through WarpgroupMatrixDescriptor to
-  /// create descriptors for each instruction.
-  ///
-  /// For example this is the case when the shape of GEMM is 128x128x128
-  ///
-  ///    nvvm.wgmma.fence.aligned
-  ///
-  ///    nvvm.wgmma.mma.async descA, descB
-  ///    iterate(descA, descB)
-  ///    nvvm.wgmma.mma.async descA, descB
-  ///    [6x times more]
-  ///
-  ///    nvvm.wgmma.group.sync.aligned
-  ///    nvvm.wgmma.wait.group.sync [groupId]
-  ///
-  class WarpgroupGemm {
+  class WarpgroupMmaHelper {
     nvgpu::WarpgroupMmaOp op;
     ImplicitLocOpBuilder b;
     OpAdaptor adaptor;
 
-    // Entire shape of the given Op
-    int64_t totalM, totalN, totalK;
-
-    // Shape of one wgmma instruction
-    int wgmmaM = 0, wgmmaN = 0, wgmmaK = 0;
-
-    // Iteration counts for GEMM
-    int iterationM = 0, iterationN = 0, iterationK = 0;
-
-    /// The function returns the shape of wgmma instruction that is defined in
-    /// PTX programming guide.
-    /// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-shape
-    void findWgmmaShape(int64_t sizeM, int64_t sizeN, Type inputElemType) {
-      wgmmaM = 64;
-      wgmmaN = sizeN;
-      if (inputElemType.isTF32()) {
-        wgmmaK = 8;
-      } else if (inputElemType.isF16() || inputElemType.isBF16()) {
-        wgmmaK = 16;
-      } else if (inputElemType.isFloat8E4M3FN() ||
-                 inputElemType.isFloat8E5M2() || inputElemType.isInteger(16)) {
-        wgmmaK = 32;
-      } else if (inputElemType.isInteger(1)) {
-        wgmmaK = 256;
-      } else {
-        llvm_unreachable("msg: not supported K shape");
-      }
-      LLVM_DEBUG(DBGS() << "Generating WgmmaMmaAsyncOp shape[m = " << wgmmaM
-                        << ", n = " << wgmmaN << ", k = " << wgmmaK << "]\n");
-    }
-
+  public:
     /// Generates WGMMATypesAttr from MLIR Type
     NVVM::WGMMATypesAttr generateWgmmaType(Type type,
                                            bool useF32 = false) const {
@@ -1296,15 +1250,13 @@ struct NVGPUWarpgroupMmaOpLowering
 
     /// Generates layout attribute for the input matrix for wgmma instruction
     NVVM::MMALayoutAttr
-    generateWgmmaLayout(std::optional<bool> transpose) const {
-      if (transpose.value_or(false))
+    generateWgmmaLayout(nvgpu::MatrixLayoutKind layout) const {
+      switch (layout) {
+      case nvgpu::MatrixLayoutKind::ROW:
+        return NVVM::MMALayoutAttr::get(op->getContext(), NVVM::MMALayout::row);
+      case nvgpu::MatrixLayoutKind::COL:
         return NVVM::MMALayoutAttr::get(op->getContext(), NVVM::MMALayout::col);
-      return NVVM::MMALayoutAttr::get(op->getContext(), NVVM::MMALayout::row);
-    }
-
-    /// Generates shape attribute for wgmma instruction
-    NVVM::MMAShapeAttr generateWgmmaShape() const {
-      return NVVM::MMAShapeAttr::get(op->getContext(), wgmmaM, wgmmaN, wgmmaK);
+      }
     }
 
     /// Generates scale attributes of output matrix for wgmma instruction
@@ -1318,177 +1270,125 @@ struct NVGPUWarpgroupMmaOpLowering
                                          NVVM::WGMMAScaleIn::one);
     }
 
-    /// Basic function to generate Add
-    Value makeAdd(Value lhs, Value rhs) {
-      return b.create<LLVM::AddOp>(lhs.getType(), lhs, rhs);
-    };
-
-    /// Moves the descriptor pointer of matrix-A for the next wgmma instruction.
-    /// Currently, it only handles row-major.
-    ///
-    /// It moves the pointer like below for [128][64] size:
-    ///                 +2 +4 +6
-    ///                  ↓  ↓  ↓
-    /// descA    ---> +--+--+--+--+
-    ///               |->|->|->|->|
-    ///               |  |  |  |  |
-    ///               |  |  |  |  |
-    ///               |  |  |  |  |
-    /// descA+512---> +-----------+
-    ///               |  |  |  |  |
-    ///               |  |  |  |  |
-    ///               |  |  |  |  |
-    ///               |  |  |  |  |
-    ///               +-----------+
-    ///
-    Value iterateDescriptorA(Value desc, int i, int j, int k) {
-      MemRefType matrixTypeA = op.getDescriptorA().getType().getTensor();
-      Type elemA = matrixTypeA.getElementType();
-      int byte = elemA.getIntOrFloatBitWidth() / 8;
-      int tileShapeA = matrixTypeA.getDimSize(1);
-      int incrementVal = ((wgmmaK * k) + (totalK * tileShapeA * i)) * byte;
-      incrementVal = incrementVal >> exclude4LSB;
-      LLVM_DEBUG(DBGS() << "\t\t[m: " << i << " n: " << j << " k: " << k
-                        << "] [wgmma descriptors] Descriptor A + "
-                        << incrementVal << " | \t ");
-      if (!incrementVal)
-        return desc;
-      return makeAdd(desc, makeI64Const(b, incrementVal));
-    }
-
-    /// Moves the descriptor pointer of matrix-B for the next wgmma instruction.
-    /// Currently, it only handles column-major.
-    ///
-    /// It moves the pointer like below for [128][64] size:
-    /// descB     ---> +--+--+--+--+--+--+--+--+
-    ///                |↓ |  |  |  |  |  |  |  |
-    ///                |↓ |  |  |  |  |  |  |  |
-    ///                |↓ |  |  |  |  |  |  |  |
-    ///                |↓ |  |  |  |  |  |  |  |
-    ///                +--+--+--+--+--+--+--+--+
-    ///
-    Value iterateDescriptorB(Value desc, int i, int j, int k) {
-      MemRefType matrixTypeB = op.getDescriptorB().getType().getTensor();
-      Type elemB = matrixTypeB.getElementType();
-      int byte = elemB.getIntOrFloatBitWidth() / 8;
-      int incrementVal = matrixTypeB.getDimSize(0) * wgmmaK * k * byte;
-      incrementVal = incrementVal >> exclude4LSB;
-      LLVM_DEBUG(DBGSE() << "Descriptor B + " << incrementVal << "\n");
-      if (!incrementVal)
-        return desc;
-      return makeAdd(desc, makeI64Const(b, incrementVal));
-    }
-
-    /// This function generates a WgmmaMmaAsyncOp using provided GMMA matrix
-    /// descriptors and arranges them based on induction variables: i, j, and k.
-    Value generateWgmma(int i, int j, int k, Value matrixC) {
-      LLVM_DEBUG(DBGS() << "\t wgmma."
-                        << "m" << wgmmaM << "n" << wgmmaN << "k" << wgmmaK
-                        << "(A[" << (iterationM * wgmmaM) << ":"
-                        << (iterationM * wgmmaM) + wgmmaM << "]["
-                        << (iterationK * wgmmaK) << ":"
-                        << (iterationK * wgmmaK + wgmmaK) << "] * "
-                        << " B[" << (iterationK * wgmmaK) << ":"
-                        << (iterationK * wgmmaK + wgmmaK) << "][" << 0 << ":"
-                        << wgmmaN << "])\n");
-
-      Value descriptorA = iterateDescriptorA(adaptor.getDescriptorA(), i, j, k);
-      Value descriptorB = iterateDescriptorB(adaptor.getDescriptorB(), i, j, k);
-
-      Type elemA = op.getDescriptorA().getType().getTensor().getElementType();
-      NVVM::WGMMATypesAttr itypeA = generateWgmmaType(elemA);
-
-      Type elemB = op.getDescriptorB().getType().getTensor().getElementType();
-      NVVM::WGMMATypesAttr itypeB = generateWgmmaType(elemB);
-
-      Type elemD = op.getMatrixC().getType().getFragmented().getElementType();
-      NVVM::WGMMATypesAttr itypeD = generateWgmmaType(elemD, true);
-
-      NVVM::MMAShapeAttr shape = generateWgmmaShape();
-      NVVM::WGMMAScaleOutAttr scaleOut = generateScaleOut();
-      NVVM::WGMMAScaleInAttr scaleIn = generateScaleIn();
-      NVVM::MMALayoutAttr layoutA = generateWgmmaLayout(op.getTransposeA());
-      NVVM::MMALayoutAttr layoutB = generateWgmmaLayout(!op.getTransposeB());
-
-      auto overflow = NVVM::MMAIntOverflowAttr::get(
-          op->getContext(), NVVM::MMAIntOverflow::wrapped);
-
-      return b.create<NVVM::WgmmaMmaAsyncOp>(
-          matrixC.getType(), matrixC, descriptorA, descriptorB, shape, itypeA,
-          itypeB, itypeD, scaleOut, scaleIn, scaleIn, layoutA, layoutB,
-          overflow);
-    }
-
-    /// Generates multiple wgmma instructions to complete the given GEMM shape
-    Value generateWgmmaGroup() {
-      Value wgmmaResult =
-          b.create<LLVM::UndefOp>(adaptor.getMatrixC().getType());
-
-      // Perform GEMM
-      SmallVector<Value> wgmmaResults;
-      for (int i = 0; i < iterationM; ++i) {
-        Value matrixC = b.create<LLVM::ExtractValueOp>(adaptor.getMatrixC(), i);
-        for (int j = 0; j < iterationN; ++j)
-          for (int k = 0; k < iterationK; ++k)
-            matrixC = generateWgmma(i, j, k, matrixC);
-        wgmmaResults.push_back(matrixC);
-      }
-      for (auto [idx, matrix] : llvm::enumerate(wgmmaResults)) {
-        wgmmaResult = b.create<LLVM::InsertValueOp>(wgmmaResult.getType(),
-                                                    wgmmaResult, matrix, idx);
-      }
-      return wgmmaResult;
-    }
-
   public:
-    WarpgroupGemm(nvgpu::WarpgroupMmaOp op, ImplicitLocOpBuilder &b,
-                  OpAdaptor adaptor)
-        : op(op), b(b), adaptor(adaptor) {
-      // Find the entire GEMM Shape
-      totalM = op.getDescriptorA().getType().getTensor().getDimSize(0);
-      totalN = op.getDescriptorB().getType().getTensor().getDimSize(1);
-      totalK = op.getDescriptorA().getType().getTensor().getDimSize(1);
-      LLVM_DEBUG(DBGS() << "===--- GEMM D[" << totalM << "][" << totalN
-                        << "] += A[" << totalM << "][" << totalK << "] * B["
-                        << totalK << "][" << totalN << "] ---===\n");
-
-      // Find the shape for one wgmma instruction
-      findWgmmaShape(
-          totalM, totalN,
-          op.getDescriptorA().getType().getTensor().getElementType());
-
-      // Iterations counts to complete the given shape with wgmma shape
-      iterationM = totalM / wgmmaM;
-      iterationN = totalN / wgmmaN;
-      iterationK = totalK / wgmmaK;
-    }
-
-    /// Generates WgmmaMmaAsync Ops to complete the specified GEMM  shape. It
-    /// includes generating a fence Op (WgmmaFenceAlignedOp) before the
-    /// instructions and group synchronization, as well as waiting
-    /// (WgmmaGroupSyncAlignedOp) for group synchronization
-    /// (WgmmaWaitGroupSyncOp) after the instructions.
-    Value generateWarpgroupMma() {
-      b.create<NVVM::WgmmaFenceAlignedOp>();
-      Value wgmmaResult = generateWgmmaGroup();
-      b.create<NVVM::WgmmaGroupSyncAlignedOp>();
-      b.create<NVVM::WgmmaWaitGroupSyncOp>(op.getWaitGroup());
-      return wgmmaResult;
-    }
+    WarpgroupMmaHelper(nvgpu::WarpgroupMmaOp op, ImplicitLocOpBuilder &b,
+                       OpAdaptor adaptor)
+        : op(op), b(b), adaptor(adaptor) {}
   };
+
   LogicalResult
   matchAndRewrite(nvgpu::WarpgroupMmaOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ImplicitLocOpBuilder b(op->getLoc(), rewriter);
 
-    // Step 1. Build a helper class
-    WarpgroupGemm warpgroupGemm(op, b, adaptor);
+    WarpgroupMmaHelper helper(op, b, adaptor);
+    std::array<int64_t, 3> wgmmaShape = op.getWgmmaShapeAsArray();
+    int64_t countN = wgmmaShape[1] / 8;
 
-    // Step 2. Get the entire GEMM Shape
-    Value wgmmaResult = warpgroupGemm.generateWarpgroupMma();
+    LLVM_DEBUG(DBGS() << "Wgmma InstructionShape {" << wgmmaShape[0] << ", "
+                      << wgmmaShape[1] << ", " << wgmmaShape[2] << "}\n");
+    LLVM_DEBUG(DBGS() << "countN: " << countN << "\n");
 
-    // Step 3. Replace fragmented result struct with the op results
-    rewriter.replaceOp(op, wgmmaResult);
+    auto cVector = op.getMatrixC();
+    ArrayRef<int64_t> cShape = cVector.getType().getShape();
+    int64_t cSize = cShape[0] * cShape[1] * cShape[2];
+
+    // Extract all the elements from the matrixC of type vector and insert in
+    // llvm.struct.
+
+    // Create llvm.struct type for accumulators
+    SmallVector<Type> structElementType;
+    for (unsigned i = 0; i < cSize; i++)
+      structElementType.push_back(cVector.getType().getElementType());
+
+    auto structType =
+        LLVM::LLVMStructType::getLiteral(op->getContext(), structElementType);
+
+    Value undefOp = b.create<LLVM::UndefOp>(structType);
+
+    // Each threads contiguous ownership of the accumulator matrix.
+    auto contiguousType =
+        LLVM::getFixedVectorType(Float32Type::get(op->getContext()), 2);
+
+    // Each threads per wgmmaShapeN of 8 ownership of the accumulator matrix.
+    auto perWgmmaShapeNType = LLVM::LLVMArrayType::get(contiguousType, 2);
+
+    LLVM_DEBUG(DBGS() << " StructType: "; structType.dump();
+               DBGS() << " UndefOp: "; undefOp.dump();
+               DBGS() << " Accumulators (per thread): "; contiguousType.dump();
+               DBGS() << " Accumulators (per thread per N=8): ";
+               perWgmmaShapeNType.dump(););
+
+    // 3D vector to flatten !llvm.struct
+    for (int i = 0; i < cShape[0]; i++) {
+      auto perWgmmaShapeNValue = b.create<LLVM::ExtractValueOp>(
+          perWgmmaShapeNType, adaptor.getMatrixC(), i);
+      for (int j = 0; j < cShape[1]; j++) {
+        auto contiguousValue = b.create<LLVM::ExtractValueOp>(
+            contiguousType, perWgmmaShapeNValue, j);
+        for (int k = 0; k < cShape[2]; k++) {
+          int64_t index = i * cShape[1] * cShape[2] + j * cShape[2] + k;
+          Value cElement = b.create<LLVM::ExtractElementOp>(
+              contiguousValue, b.create<LLVM::ConstantOp>(
+                                   b.getI64Type(), b.getI64IntegerAttr(k)));
+          undefOp = b.create<LLVM::InsertValueOp>(undefOp, cElement, index);
+        }
+      }
+    }
+
+    // Create NVVM::WgmmaMmaAsyncOp
+    auto mmaShape = NVVM::MMAShapeAttr::get(op->getContext(), wgmmaShape[0],
+                                            wgmmaShape[1], wgmmaShape[2]);
+    NVVM::WGMMATypesAttr nvvmTypeA = helper.generateWgmmaType(op.getTypeA());
+    NVVM::WGMMATypesAttr nvvmTypeB = helper.generateWgmmaType(op.getTypeB());
+    NVVM::WGMMATypesAttr nvvmTypeC =
+        helper.generateWgmmaType(cVector.getType().getElementType(), true);
+
+    NVVM::WGMMAScaleOutAttr scaleOut = helper.generateScaleOut();
+    NVVM::WGMMAScaleInAttr scaleIn = helper.generateScaleIn();
+    NVVM::MMALayoutAttr layoutA = helper.generateWgmmaLayout(op.getLayoutA());
+    NVVM::MMALayoutAttr layoutB = helper.generateWgmmaLayout(op.getLayoutB());
+
+    auto overflow = NVVM::MMAIntOverflowAttr::get(
+        op->getContext(), NVVM::MMAIntOverflow::wrapped);
+
+    auto nvvmResultOp = b.create<NVVM::WgmmaMmaAsyncOp>(
+        undefOp.getType(), undefOp, adaptor.getDescriptorA(),
+        adaptor.getDescriptorB(), mmaShape, nvvmTypeA, nvvmTypeB, nvvmTypeC,
+        scaleOut, scaleIn, scaleIn, layoutA, layoutB, overflow);
+
+    // nvvmResultOp is of type llvm.struct, but it needs to be backed into the
+    // llvm.array type.
+    Type desiredRetTy = typeConverter->convertType(op->getResultTypes()[0]);
+    LLVM_DEBUG(DBGS() << " desiredRetTy: "; desiredRetTy.dump(););
+    LLVM_DEBUG(DBGS() << " nvvmResultOp: "; nvvmResultOp.dump(););
+    LLVM_DEBUG(DBGS() << " nvvmResultOp.getResult().getType(): ";
+               nvvmResultOp.getResult().getType().dump(););
+
+    // Flatten the !llvm.struct to !llvm.array
+    Value resultValue = b.create<LLVM::UndefOp>(desiredRetTy);
+
+    for (int i = 0; i < cShape[0]; i++) {
+      Value perWgmmaShapeNValue = b.create<LLVM::UndefOp>(perWgmmaShapeNType);
+      for (int j = 0; j < cShape[1]; j++) {
+        Value contiguousValue = b.create<LLVM::UndefOp>(contiguousType);
+        for (int k = 0; k < cShape[2]; k++) {
+          int64_t index = i * cShape[1] * cShape[2] + j * cShape[2] + k;
+          Value cElement = b.create<LLVM::ExtractValueOp>(nvvmResultOp, index);
+          contiguousValue = b.create<LLVM::InsertElementOp>(
+              contiguousType, contiguousValue, cElement,
+              b.create<LLVM::ConstantOp>(b.getI64Type(),
+                                         b.getI64IntegerAttr(k)));
+        }
+        perWgmmaShapeNValue = b.create<LLVM::InsertValueOp>(
+            perWgmmaShapeNType, perWgmmaShapeNValue, contiguousValue, j);
+      }
+      resultValue = b.create<LLVM::InsertValueOp>(desiredRetTy, resultValue,
+                                                  perWgmmaShapeNValue, i);
+    }
+
+    // replace NVGPU::WarpgroupMma with NVVM::WgmmaMmaAsyncOp
+    rewriter.replaceOp(op, resultValue);
     return success();
   }
 };
@@ -1512,20 +1412,32 @@ struct NVGPUWarpgroupMmaStoreOpLowering
   ///
   /// Matrix-D:
   ///   +______________________________________________________________________+
-  ///   |     0-1  |    2-3  |    4-5  |    6-7  |   8-9  |   10-11|..|N-8,N-7 |
-  /// 0 | T0:d0-d1 |T1:d0-d1 |T2:d0-d1 |T3:d0-d1 |T0:d4-d5| T1:d4-d5..|T0:dX-dY|
-  /// 1 | T4:d0-d1 |T5:d0-d1 |T6:d0-d1 |T7:d0-d1 |T4:d4-d5| T5:d4-d5..|T4:dX-dY|
-  /// ..| .........|.........|.........|.........|........|...........|........|
-  /// 8 | T0:d2-d3 |T1:d2-d3 |T2:d2-d3 |T3:d2-d3 |T0:d6-d7|T1:d6-d7,..|T0:dZ-dW|
-  /// 9 | T4:d2-d3 |T5:d2-d3 |T6:d2-d3 |T7:d2-d3 |T4:d6-d7| T5:d6-d7..|T4:dZ-dW|
-  /// ..| .........|.........|.........|.........|........|...........|........|
-  /// 15| T28:d2-d3|T29:d2-d3|T30:d2-d3|T31:d2-d3|........|...........|........|
-  /// 16| T32:d2-d3|T33:d2-d3|T34:d2-d3|T35:d2-d3|........|...........|........|
-  /// ..| .........|.........|.........|.........|........|...........|........|
-  /// 32| T64:d2-d3|T65:d2-d3|T66:d2-d3|T67:d2-d3|........|...........|........|
-  /// ..| .........|.........|.........|.........|........|...........|........|
-  /// 48| T96:d2-d3|T97:d2-d3|T98:d2-d3|T99:d2-d3|........|...........|........|
-  /// ..| .........|.........|.........|.........|........|...........|........|
+  ///   |     0-1  |    2-3  |    4-5  |    6-7  |   8-9  |   10-11|..|N-8,N-7
+  ///   |
+  /// 0 | T0:d0-d1 |T1:d0-d1 |T2:d0-d1 |T3:d0-d1 |T0:d4-d5|
+  /// T1:d4-d5..|T0:dX-dY| 1 | T4:d0-d1 |T5:d0-d1 |T6:d0-d1 |T7:d0-d1
+  /// |T4:d4-d5| T5:d4-d5..|T4:dX-dY|
+  /// ..|
+  /// .........|.........|.........|.........|........|...........|........|
+  /// 8 | T0:d2-d3 |T1:d2-d3 |T2:d2-d3 |T3:d2-d3
+  /// |T0:d6-d7|T1:d6-d7,..|T0:dZ-dW| 9 | T4:d2-d3 |T5:d2-d3 |T6:d2-d3
+  /// |T7:d2-d3 |T4:d6-d7| T5:d6-d7..|T4:dZ-dW|
+  /// ..|
+  /// .........|.........|.........|.........|........|...........|........|
+  /// 15|
+  /// T28:d2-d3|T29:d2-d3|T30:d2-d3|T31:d2-d3|........|...........|........|
+  /// 16|
+  /// T32:d2-d3|T33:d2-d3|T34:d2-d3|T35:d2-d3|........|...........|........|
+  /// ..|
+  /// .........|.........|.........|.........|........|...........|........|
+  /// 32|
+  /// T64:d2-d3|T65:d2-d3|T66:d2-d3|T67:d2-d3|........|...........|........|
+  /// ..|
+  /// .........|.........|.........|.........|........|...........|........|
+  /// 48|
+  /// T96:d2-d3|T97:d2-d3|T98:d2-d3|T99:d2-d3|........|...........|........|
+  /// ..|
+  /// .........|.........|.........|.........|........|...........|........|
   ///   +______________________________________________________________________+
   ///
   /// \param rewriter: The pattern rewriter.

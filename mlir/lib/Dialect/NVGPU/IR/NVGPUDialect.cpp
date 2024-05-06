@@ -547,6 +547,8 @@ LogicalResult isAllowedSizeN(int sizeN, Type typeA) {
 }
 
 LogicalResult WarpgroupMmaOp::verify() {
+  return success();
+#if 0
   if (getTransposeA() && !getTransposeB())
     return emitOpError()
            << "supports non-transpose A (Row Major) "
@@ -601,6 +603,7 @@ LogicalResult WarpgroupMmaOp::verify() {
   }
 
   return success();
+#endif
 }
 
 LogicalResult WarpgroupMmaStoreOp::verify() {

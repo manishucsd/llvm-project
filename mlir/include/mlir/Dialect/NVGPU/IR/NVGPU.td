@@ -66,6 +66,21 @@ def NVGPU_Dialect : Dialect {
 // NVGPU Attribute Definitions
 //===----------------------------------------------------------------------===//
 
+
+/// Enum attribute of the row-major and column-major matrix layout. It is 
+/// confusing to use transpose attribute to represent the matrix layout.
+/// For example, the transpose attribute is used to represent the column-major
+/// layout for matrix A and row-major layout for matrix B in the Tensor Core
+/// operations. The layout enum attribute is added to remove the confusion.
+def MatrixLayoutRow : I32EnumAttrCase<"ROW", 0, "row">;
+def MatrixLayoutCol : I32EnumAttrCase<"COL", 1, "col">;
+
+def MatrixLayoutKind : I32EnumAttr<"MatrixLayoutKind", "NVGPU Matrix layout",
+  [MatrixLayoutRow, MatrixLayoutCol]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::nvgpu";
+}
+
 def TensorMapSwizzleNone : I32EnumAttrCase<"SWIZZLE_NONE", 0, "none">;
 def TensorMapSwizzle32B  : I32EnumAttrCase<"SWIZZLE_32B", 1, "swizzle_32b">;
 def TensorMapSwizzle64B  : I32EnumAttrCase<"SWIZZLE_64B", 2, "swizzle_64b">;
@@ -113,6 +128,10 @@ def TensorMapSwizzleAttr : EnumAttr<NVGPU_Dialect, TensorMapSwizzleKind, "swizzl
 def TensorMapL2PromoAttr : EnumAttr<NVGPU_Dialect, TensorMapL2PromoKind, "l2promo">;
 def TensorMapOOBAttr : EnumAttr<NVGPU_Dialect, TensorMapOOBKind, "oob">;
 def TensorMapInterleaveAttr : EnumAttr<NVGPU_Dialect, TensorMapInterleaveKind, "interleave">;
+
+def MatrixLayoutAttr : EnumAttr<NVGPU_Dialect, MatrixLayoutKind, "matrix_layout"> {
+  let assemblyFormat = "`<` $value `>`";  
+}
 
 //===----------------------------------------------------------------------===//
 // NVGPU Type Definitions
@@ -215,6 +234,9 @@ def NVGPU_WarpgroupAccumulator : NVGPU_Type<"WarpgroupAccumulator", "warpgroup.a
 // NVGPU Op Definitions
 //===----------------------------------------------------------------------===//
 
+//////////////////////////////////////////////////////////////////////////////
+///                   Ampere NVGPU Operations                              ///
+//////////////////////////////////////////////////////////////////////////////
 class NVGPU_Op<string mnemonic, list<Trait> traits = []> :
   Op<NVGPU_Dialect, mnemonic, traits> {}
 
@@ -489,6 +511,9 @@ def NVGPU_DeviceAsyncWaitOp : NVGPU_Op<"device_async_wait", []> {
   }];
 }
 
+//////////////////////////////////////////////////////////////////////////////
+///                   Hopper NVGPU Operations                              ///
+//////////////////////////////////////////////////////////////////////////////
 def NVGPU_MBarrierCreateOp : NVGPU_Op<"mbarrier.create", []> {
   let summary = "Creates a `nvgpu.mbarrier` object.";
   let description = [{
@@ -728,8 +753,8 @@ def NVGPU_WarpgroupGenerateDescriptorOp : NVGPU_Op<"warpgroup.generate.descripto
 
 def NVGPU_WarpgroupMmaOp : NVGPU_Op<"warpgroup.mma"> {
   let description = [{
-    The `nvgpu.warpgroup.mma` op performs the warpgroup-level (4 warps) 
-    matrix-multiply-and-accumulate (mma) operation that results in 
+    The `nvgpu.warpgroup.mma` op performs the warpgroup-level  
+    matrix-multiply-and-accumulate (wgmma) operation that results in 
     `nvvm.wgmma.mma_async`. 
     
     The operands are `descriptorA` and `descriptorB` that are wgmma matrix 
@@ -756,18 +781,32 @@ def NVGPU_WarpgroupMmaOp : NVGPU_Op<"warpgroup.mma"> {
     ```
   }];
 
-  let arguments = (ins NVGPU_WarpgroupMatrixDescriptor:$descriptorA, 
-                       NVGPU_WarpgroupMatrixDescriptor:$descriptorB,                                               
-                       DefaultValuedOptionalAttr<I32Attr, "1">:$waitGroup,
-                       OptionalAttr<UnitAttr>:$transposeA,
-                       OptionalAttr<UnitAttr>:$transposeB,
-                       NVGPU_WarpgroupAccumulator:$matrixC);
-  let results = (outs NVGPU_WarpgroupAccumulator:$matrixD);
+  let arguments = (ins I64:$descriptorA, 
+                       I64:$descriptorB,                                               
+                       AnyVector:$matrixC,
+                       I64ArrayAttr:$wgmmaShape,
+                       TypeAttr:$typeA,
+                       TypeAttr:$typeB,
+                       DefaultValuedAttr<
+                        MatrixLayoutAttr, "::mlir::nvgpu::MatrixLayoutKind::ROW">:$layoutA,
+                       DefaultValuedAttr<
+                        MatrixLayoutAttr, "::mlir::nvgpu::MatrixLayoutKind::COL">:$layoutB);
+  let results = (outs AnyVector:$matrixD);
   let assemblyFormat = [{    
-    $descriptorA`,` $descriptorB`,` $matrixC attr-dict
+    `(` $descriptorA`,` $descriptorB`,` $matrixC `)` attr-dict
     `:` type($descriptorA) `,` type($descriptorB) `,` type($matrixC) `->` type($matrixD)
   }];
   let hasVerifier = 1;
+
+ let extraClassDeclaration = [{
+    std::array<int64_t, 3> getWgmmaShapeAsArray() {
+      ArrayAttr wgmmaShape = this->getWgmmaShape();
+      assert(wgmmaShape.size() == 3 && "Wgmma instruction shape should be three integers");
+      return {::llvm::cast<IntegerAttr>(wgmmaShape[0]).getInt(),
+              ::llvm::cast<IntegerAttr>(wgmmaShape[1]).getInt(),
+              ::llvm::cast<IntegerAttr>(wgmmaShape[2]).getInt()};
+    }
+  }];
 }
 
 def NVGPU_WarpgroupMmaStoreOp : NVGPU_Op<"warpgroup.mma.store"> {
